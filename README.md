@@ -5,7 +5,7 @@ Pinned Ethereum-mainnet-fork Foundry PoC against block `25,869,553`.
 ## Run
 
 ```bash
-forge install foundry-rs/forge-std@v1.16.2 --no-commit
+forge install foundry-rs/forge-std@v1.16.2 --no-git
 ETH_RPC_URL=<archive-ethereum-rpc> forge test --match-contract CheckpointSnipingPoC -vv
 ```
 
